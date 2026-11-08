@@ -125,6 +125,17 @@ def _is_pair_number(value: Any) -> bool:
     return 1 <= n <= 12 and str(value).strip() in {str(n), f"{n}.0"}
 
 
+def _is_self_study(subject: Any, room: Any = None) -> bool:
+    """Recognize the college's self-study marker without displaying it as a lesson."""
+    subject_text = (_text(subject) or "").casefold()
+    room_text = re.sub(r"\s+", "", (_text(room) or "").casefold())
+    return bool(
+        re.search(r"(?<![а-яё])с\s*/\s*р(?![а-яё])", subject_text)
+        or room_text in {"с/р", "ср", "самостоятельнаяработа"}
+        or "самостоятельная работа" in subject_text
+    )
+
+
 def _day_name(date_value: datetime) -> str:
     names = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     return names[date_value.weekday()]
@@ -215,12 +226,14 @@ def parse_xlsx(path: str | Path) -> dict[str, Any]:
                             subject = _text(row.get(subject_col))
                             if not subject or not _is_pair_number(pair_value):
                                 continue
+                            room = _text(row.get(base_col + 3)) or _text(row.get(base_col + 1))
                             lesson = {
                                 "pair": int(pair_value),
                                 "subject": subject,
-                                "room": _text(row.get(base_col + 3)) or _text(row.get(base_col + 1)),
+                                "room": room,
                                 "teacher": _text(teacher_row.get(subject_col)),
                                 "subgroup": subgroup,
+                                "self_study": _is_self_study(subject, room),
                             }
                             group["days"].setdefault(current_date, []).append(lesson)
 
@@ -251,6 +264,151 @@ def parse_xlsx(path: str | Path) -> dict[str, Any]:
             "table_count": parsed_tables,
         }
 
+
+
+def parse_replacement_xlsx(path: str | Path) -> dict[str, Any]:
+    """Parse a dated daily replacement workbook (the college's compact template).
+
+    Unlike the weekly timetable, this layout has repeated blocks headed by
+    ``Группа:``. Every lesson is represented by a subject row followed by a
+    teacher row. A lesson's pair is derived from the individual lesson number.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise FileNotFoundError(file_path)
+    if file_path.suffix.lower() != ".xlsx":
+        raise ValueError("Поддерживаются только файлы .xlsx")
+
+    def number(value: Any) -> int | None:
+        text = _text(value)
+        if not text:
+            return None
+        match = re.fullmatch(r"(\d+)(?:\.0+)?", text)
+        return int(match.group(1)) if match else None
+
+    with zipfile.ZipFile(file_path) as archive:
+        shared = _load_shared_strings(archive)
+        groups: dict[str, dict[str, Any]] = {}
+        all_dates: set[str] = set()
+        parsed_blocks = 0
+        title_text = ""
+        sheet_names = _worksheet_paths(archive)
+        for sheet_name, sheet_path in sheet_names:
+            rows = _read_sheet(archive, sheet_path, shared)
+            if not rows:
+                continue
+
+            title_text = " ".join(
+                _text(value) or ""
+                for row_no, row in rows.items() if row_no <= 3
+                for value in row.values()
+            )
+            date_match = DATE_RE.search(file_path.name) or DATE_RE.search(title_text) or DATE_RE.search(sheet_name)
+            if not date_match:
+                continue
+            day_obj = datetime.strptime(date_match.group("date"), "%d.%m.%Y").date()
+            day_text = day_obj.isoformat()
+            all_dates.add(day_text)
+
+            # The top header has one "Дисциплина" column per group column.
+            header_candidates = [
+                (row_no, row) for row_no, row in rows.items()
+                if any((_text(v) or "").casefold() == "дисциплина" for v in row.values())
+                and any((_text(v) or "").casefold() == "пара" for v in row.values())
+            ]
+            if not header_candidates:
+                continue
+            header_row_no, header_row = header_candidates[0]
+            discipline_cols = {
+                col for col, value in header_row.items()
+                if (_text(value) or "").casefold() == "дисциплина"
+            }
+            group_rows = [
+                row_no for row_no, row in rows.items()
+                if any((_text(value) or "").casefold() == "группа:" for value in row.values())
+            ]
+            for block_index, group_row_no in enumerate(group_rows):
+                group_row = rows.get(group_row_no, {})
+                block_groups = [
+                    (str(_text(group_row.get(col))), col)
+                    for col in sorted(discipline_cols)
+                    if _text(group_row.get(col)) and GROUP_RE.fullmatch(str(_text(group_row.get(col))))
+                ]
+                if not block_groups:
+                    continue
+                parsed_blocks += 1
+                next_group_row = group_rows[block_index + 1] if block_index + 1 < len(group_rows) else max(rows, default=group_row_no) + 1
+                first_subject_row = group_row_no + 1
+
+                for group_code, base_col in block_groups:
+                    group = groups.setdefault(group_code, {"sheet": sheet_name, "days": {}})
+                    day_lessons = group.setdefault("days", {}).setdefault(day_text, [])
+
+                    # Subject rows alternate with teacher rows. Only read those
+                    # subject rows so teacher names cannot be mistaken for subjects.
+                    for row_no in range(first_subject_row, next_group_row, 2):
+                        row = rows.get(row_no, {})
+                        teacher_row = rows.get(row_no + 1, {})
+                        lesson_number = number(row.get(2))
+                        pair_value = number(row.get(1))
+                        if lesson_number is None:
+                            if pair_value is None:
+                                continue
+                            lesson_number = pair_value * 2 - 1
+                        if not 1 <= lesson_number <= 20:
+                            continue
+                        pair = pair_value or ((lesson_number + 1) // 2)
+                        if not 1 <= pair <= 10:
+                            continue
+
+                        room = _text(row.get(base_col + 3)) or _text(row.get(base_col + 1))
+                        for subgroup, subject_col in ((1, base_col), (2, base_col + 2)):
+                            subject = _text(row.get(subject_col))
+                            if not subject:
+                                continue
+                            # Header labels and numeric markers are not disciplines.
+                            if subject.casefold() in {"дисциплина", "преподаватель", "ауд.", "ауд"}:
+                                continue
+                            teacher = _text(teacher_row.get(subject_col))
+                            item = {
+                                "pair": pair,
+                                "lesson_number": lesson_number,
+                                "subject": subject,
+                                "room": room,
+                                "teacher": teacher,
+                                "subgroup": subgroup,
+                                "self_study": _is_self_study(subject, room),
+                            }
+                            if item not in day_lessons:
+                                day_lessons.append(item)
+
+        if not groups:
+            raise ValueError(
+                "Не удалось распознать XLSX как недельное расписание или таблицу замен. "
+                "Ожидались строки «Группа:», «Пара», «Урок» и «Дисциплина»."
+            )
+
+    for group in groups.values():
+        for lessons in group["days"].values():
+            lessons.sort(key=lambda item: (item.get("pair", 0), item.get("lesson_number", 0), item.get("subgroup", 0)))
+
+    dates = sorted(all_dates or {day for group in groups.values() for day in group.get("days", {})})
+    if not dates:
+        raise ValueError("В файле замен не удалось определить дату.")
+    title_all = file_path.name.casefold() + " " + title_text.casefold()
+    replacement_mode = "supplement" if "дополнительно" in title_all else "replace"
+    return {
+        "source_file": file_path.name,
+        "parsed_at": datetime.now().isoformat(timespec="seconds"),
+        "date_from": dates[0],
+        "date_to": dates[-1],
+        "dates": dates,
+        "groups": groups,
+        "group_count": len(groups),
+        "table_count": parsed_blocks,
+        "replacement_mode": replacement_mode,
+        "format": "daily_replacement",
+    }
 
 def save_json(data: dict[str, Any], path: str | Path) -> None:
     destination = Path(path)

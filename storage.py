@@ -41,6 +41,12 @@ class UserStorage:
                 (int(user_id), str(group_code)),
             )
 
+    def clear_group(self, user_id: int) -> bool:
+        """Forget one user's saved group; other users are not affected."""
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM users WHERE user_id = ?", (int(user_id),))
+            return cursor.rowcount > 0
+
     def all_users(self) -> list[tuple[int, str]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT user_id, group_code FROM users").fetchall()

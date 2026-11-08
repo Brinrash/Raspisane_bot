@@ -56,12 +56,12 @@
 MAX_BOT_TOKEN=токен_твоего_MAX_бота
 MAX_ADMIN_IDS=твой_MAX_user_id
 MAX_SOURCE_CHAT_ID=-69158905315551
-TIMEZONE=Europe/Warsaw
+TIMEZONE=Europe/Moscow
 DATA_DIR=/app/data
 MAX_WEBHOOK_URL=https://ТВОЙ-ДОМЕН/webhook
 WEBHOOK_SECRET=случайный_секрет_не_короче_5_символов
 WEBHOOK_PATH=/webhook
-PORT=8080
+PORT=3000
 MAX_CA_BUNDLE=/app/certs/russian_trusted_root_ca_pem.crt
 MAX_UPLOAD_MB=20
 NOTIFY_USERS_ON_UPDATE=true
@@ -106,7 +106,7 @@ MAX указывает, что для исходящих запросов к `pl
 В логах успешного запуска должны появиться строки примерно такого вида:
 
 ```text
-MAX Webhook HTTP server запущен: port=8080 path=/webhook
+MAX Webhook HTTP server запущен: port=3000 path=/webhook
 Подписка MAX Webhook настроена: True
 ```
 
@@ -122,7 +122,13 @@ MAX Webhook HTTP server запущен: port=8080 path=/webhook
 
 Затем открой MAX и отправь боту `/start`. Проверь выбор группы, `/week`, `/bells`, затем перешли тестовую публикацию с XLSX из разрешённого канала.
 
-Если в логах указан Long Polling, значит `MAX_WEBHOOK_URL` не задан или пуст. Если ошибка 401 при регистрации подписки — проверь `MAX_BOT_TOKEN`. Если MAX не доставляет события — проверь публичный HTTPS-домен, путь `/webhook`, `WEBHOOK_SECRET` и наличие активной подписки.
+Если в логах указан Long Polling, значит `MAX_WEBHOOK_URL` не задан или пуст. Для домена, который Bothost выдал этому проекту, добавь отдельную переменную окружения:
+
+```env
+MAX_WEBHOOK_URL=https://bot-1794144695-4093-brinrash.bothost.tech/webhook
+```
+
+Если у проекта в панели другой домен, используй фактический адрес из карточки бота. Поле «Порт веб-приложения» и переменная `PORT` должны совпадать: в форме Bothost по умолчанию указан `3000`, поэтому в этом примере используется `PORT=3000`. Если ошибка 401 при регистрации подписки — проверь `MAX_BOT_TOKEN`. Если MAX не доставляет события — проверь публичный HTTPS-домен, путь `/webhook`, `WEBHOOK_SECRET` и наличие активной подписки.
 
 ## 7. Важные замечания
 

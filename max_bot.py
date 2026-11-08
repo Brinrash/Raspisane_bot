@@ -22,7 +22,7 @@ from config import (
 )
 from bells import (
     bell_for_date, format_bells, load_bell_data, merge_bell_override,
-    pair_time, parse_bell_document, prune_bell_data, save_bell_data,
+    pair_time, parse_bell_document_dates, prune_bell_data, save_bell_data,
 )
 from group_picker import course_keyboard, group_page_keyboard, home_keyboard
 from max_api import MaxApi, MaxApiError
@@ -85,11 +85,29 @@ def _subject_parts(lesson: dict[str, Any]) -> tuple[str, None]:
 
 
 def lesson_line(lesson: dict[str, Any], day: date | None = None, bell_data: dict[str, Any] | None = None) -> str:
-    """Render a pair as a compact block; bell periods are two lessons per pair."""
+    """Render an attended lesson or a visually separate self-study item."""
     pair = int(lesson.get("pair") or 0)
     subject, _ = _subject_parts(lesson)
-    lesson_time = pair_time(day, pair, bell_data) if day is not None else None
+    room = str(lesson.get("room") or "").strip()
+    self_study = bool(lesson.get("self_study")) or bool(
+        re.search(r"(?<![а-яё])с\s*/\s*р(?![а-яё])", str(lesson.get("subject") or ""), re.IGNORECASE)
+        or re.sub(r"\s+", "", room.casefold()) in {"с/р", "ср", "самостоятельнаяработа"}
+        or "самостоятельная работа" in str(lesson.get("subject") or "").casefold()
+    )
 
+    teacher = str(lesson.get("teacher") or "").strip()
+    if self_study:
+        # A self-study assignment does not require attendance: intentionally
+        # show neither a pair number nor a bell time/room.
+        subject = re.sub(r"\s*(?:с\s*/\s*р|самостоятельная\s+работа)\s*$", "", subject, flags=re.IGNORECASE).strip()
+        lines = ["📝 САМОСТОЯТЕЛЬНАЯ РАБОТА"]
+        if subject:
+            lines.append(subject)
+        if teacher:
+            lines.append(f"   👨‍🏫 {teacher}")
+        return "\n".join(lines)
+
+    lesson_time = pair_time(day, pair, bell_data) if day is not None else None
     if pair == 0:
         heading = f"🟡 Классный час · {lesson_time}" if lesson_time else "🟡 Классный час"
     else:
@@ -98,15 +116,8 @@ def lesson_line(lesson: dict[str, Any], day: date | None = None, bell_data: dict
     lines = [heading]
     if not (pair == 0 and subject.casefold() == "классный час"):
         lines.append(subject)
-
-    room = str(lesson.get("room") or "").strip()
     if room:
-        if room.casefold().replace(" ", "") in {"с/р", "ср"}:
-            lines.append("   📝 Самостоятельная работа")
-        else:
-            lines.append(f"   📍 Каб.: {room}")
-
-    teacher = str(lesson.get("teacher") or "").strip()
+        lines.append(f"   📍 Каб.: {room}")
     if teacher:
         lines.append(f"   👨‍🏫 {teacher}")
     return "\n".join(lines)
@@ -381,33 +392,42 @@ class ScheduleMaxBot:
 
     async def apply_bell_file(self, path: Path, original_name: str, source: str) -> dict[str, Any]:
         global bell_schedule
-        target_day, parsed = parse_bell_document(path)
+        target_days, parsed = parse_bell_document_dates(path)
         start, end = retention_bounds(local_today())
-        if not start <= target_day <= end:
+        outside = [day for day in target_days if not start <= day <= end]
+        if outside:
+            labels = ", ".join(day.strftime("%d.%m.%Y") for day in outside)
             raise ValueError(
-                f"Дата {target_day:%d.%m.%Y} вне окна хранения ({start:%d.%m.%Y} — {end:%d.%m.%Y})."
+                f"Даты {labels} вне окна хранения ({start:%d.%m.%Y} — {end:%d.%m.%Y})."
             )
-        bell_schedule = merge_bell_override(bell_schedule, target_day, parsed, original_name)
+        for target_day in target_days:
+            bell_schedule = merge_bell_override(bell_schedule, target_day, parsed, original_name)
         bell_schedule = prune_bell_data(bell_schedule, local_today())
         save_bell_data(bell_schedule, BELL_JSON)
-        logger.info("Импортированы изменения звонков: %s, дата=%s, source=%s", original_name, target_day, source)
+        date_labels = ", ".join(day.strftime("%d.%m.%Y") for day in target_days)
+        logger.info("Импортированы изменения звонков: %s, dates=%s, source=%s", original_name, date_labels, source)
         await self.send_admins(
-            f"🔔 Изменения звонков сохранены.\nФайл: {original_name}\nДата: {target_day:%d.%m.%Y}\n"
-            f"Занятий с временем в файле: {len(parsed.get('lessons', {}))}\nИсточник: {source}"
+            f"🔔 Изменения звонков сохранены.\nФайл: {original_name}\nДаты: {date_labels}\n"
+            f"Уроков с временем в файле: {len(parsed.get('lessons', {}))}\n"
+            f"Специальное расписание: {'да' if parsed.get('complete_timetable') else 'нет'}\nИсточник: {source}"
         )
         if NOTIFY_USERS_ON_UPDATE:
-            for user_id, group_code in storage.all_users():
+            notified: set[int] = set()
+            for user_id, _group_code in storage.all_users():
+                if user_id in notified:
+                    continue
+                notified.add(user_id)
                 try:
                     await self.send_user(
                         user_id,
-                        f"🔔 На {target_day:%d.%m.%Y} опубликовано изменение расписания звонков. "
+                        f"🔔 Опубликовано изменение расписания звонков на даты: {date_labels}. "
                         "Время занятий обновлено в расписании.",
                         home_keyboard(),
                     )
                 except Exception:
                     logger.exception("Не удалось уведомить MAX-пользователя %s об изменении звонков", user_id)
         prune_incoming_files(INCOMING_DIR, local_today())
-        return {"date": target_day.isoformat(), "lessons": len(parsed.get("lessons", {}))}
+        return {"dates": [day.isoformat() for day in target_days], "lessons": len(parsed.get("lessons", {}))}
 
     async def show_group_picker(self, user_id: int, callback_id: str | None = None) -> None:
         text = "🎓 Выбери курс:" if schedule.get("groups") else "В расписании пока нет групп. Администратор должен загрузить XLSX."
@@ -434,13 +454,17 @@ class ScheduleMaxBot:
             text = (
                 "Привет! Я бот расписания занятий.\n\n"
                 "Выбери группу, затем смотри расписание на сегодня, завтра или неделю.\n"
-                "Команды также можно отправлять текстом: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /myid."
+                "Команды также можно отправлять текстом: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /resetgroup, /myid."
                 if payload == "menu:help" else "Главное меню расписания."
             )
             await self.answer(callback_id, text, home_keyboard())
             return
         if payload == "menu:groups":
             await self.show_group_picker(user_id, callback_id)
+            return
+        if payload == "menu:resetgroup":
+            storage.clear_group(user_id)
+            await self.answer(callback_id, "Сохранённая группа сброшена. Теперь выбери курс и группу:", course_keyboard(schedule.get("groups", {})))
             return
         if payload == "menu:today":
             await self.answer(callback_id, selected_day_text(user_id, local_today()), home_keyboard())
@@ -563,8 +587,8 @@ class ScheduleMaxBot:
                 ):
                     bell_result = await self.apply_bell_file(path, filename, source_label)
                     result = (
-                        f"✅ Изменения звонков приняты.\nДата: {bell_result['date']}\n"
-                        f"Изменено занятий: {bell_result['lessons']}"
+                        f"✅ Изменения звонков приняты.\nДаты: {', '.join(bell_result['dates'])}\n"
+                        f"Уроков с временем: {bell_result['lessons']}"
                     )
                     if sender_id is not None:
                         await self.send_user(sender_id, result, home_keyboard())
@@ -630,7 +654,7 @@ class ScheduleMaxBot:
             return
 
         if normalized in {"/help", "help", "помощь"}:
-            await reply("Команды: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /myid, /status. Также используй кнопки меню.", home_keyboard())
+            await reply("Команды: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /resetgroup, /myid, /status. Также используй кнопки меню.", home_keyboard())
             return
         if normalized in {"/myid", "myid", "мой id", "/id"}:
             await reply(f"Твой MAX user_id: {sender_id}\nДля настройки администратора добавь это число в MAX_ADMIN_IDS файла .env.", home_keyboard())
@@ -642,6 +666,14 @@ class ScheduleMaxBot:
             return
         if normalized in {"/group", "group", "группа", "выбрать группу", "сменить группу"}:
             await reply("🎓 Выбери курс:", course_keyboard(schedule.get("groups", {})))
+            return
+        if normalized in {"/resetgroup", "/clear_group", "сбросить группу", "сбросить мою группу"}:
+            was_set = storage.clear_group(sender_id)
+            message_text = (
+                "Сохранённая группа сброшена. Выбери курс и группу заново."
+                if was_set else "У тебя ещё не была сохранена группа. Выбери курс и группу."
+            )
+            await reply(message_text, course_keyboard(schedule.get("groups", {})))
             return
         if normalized in {"/today", "сегодня", "📅 сегодня"}:
             await reply(selected_day_text(sender_id, local_today()), home_keyboard())

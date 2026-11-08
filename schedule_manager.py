@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from parser import parse_xlsx, save_json
+from parser import parse_replacement_xlsx, parse_xlsx, save_json
 
 
 def retention_bounds(today: date) -> tuple[date, date]:
@@ -143,10 +143,43 @@ def merge_schedule_data(
             accepted_incoming_dates.add(date_text)
             old_lessons = target["days"].get(date_text)
             new_lessons = deepcopy(lessons)
-            if old_lessons != new_lessons:
+            if incoming.get("replacement_mode") == "supplement":
+                # "Дополнительно" files supplement a day's timetable. Where
+                # both files contain the same individual lesson slot and
+                # subgroup, the newer row wins; all other lessons are kept.
+                combined = deepcopy(old_lessons or [])
+                for incoming_lesson in new_lessons:
+                    slot_key = (
+                        incoming_lesson.get("pair"),
+                        incoming_lesson.get("lesson_number"),
+                        incoming_lesson.get("subgroup"),
+                    )
+                    matched_index = next((
+                        index for index, existing_lesson in enumerate(combined)
+                        if existing_lesson.get("lesson_number") is not None
+                        and (
+                            existing_lesson.get("pair"),
+                            existing_lesson.get("lesson_number"),
+                            existing_lesson.get("subgroup"),
+                        ) == slot_key
+                    ), None)
+                    if matched_index is not None:
+                        combined[matched_index] = incoming_lesson
+                    elif incoming_lesson not in combined:
+                        combined.append(incoming_lesson)
+                combined.sort(key=lambda item: (
+                    int(item.get("pair") or 0),
+                    int(item.get("lesson_number") or 0),
+                    int(item.get("subgroup") or 0),
+                ))
+                final_lessons = combined
+            else:
+                final_lessons = new_lessons
+
+            if old_lessons != final_lessons:
                 changed_groups.add(group_code)
                 changed_dates.add(date_text)
-            target["days"][date_text] = new_lessons
+            target["days"][date_text] = final_lessons
 
     if incoming.get("dates") and not accepted_incoming_dates:
         has_current_window_data = any(
@@ -188,6 +221,7 @@ def merge_schedule_data(
         "changed_dates": sorted(changed_dates),
         "incoming_groups": len(incoming.get("groups", {})),
         "incoming_dates": sorted(incoming.get("dates", [])),
+        "replacement_mode": incoming.get("replacement_mode", "replace"),
         "removed_dates": prune_info["removed_dates"],
         "retention_start": prune_info["retention_start"],
         "retention_end": prune_info["retention_end"],
@@ -205,7 +239,35 @@ def import_schedule_file(
     source_name: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     path = Path(file_path)
-    parsed = parse_xlsx(path)
+    # Daily replacement workbooks have a different layout from the weekly file.
+    # Prefer their dedicated parser when the file's name/title identifies them;
+    # this also avoids the misleading weekly-parser traceback seen in older builds.
+    is_replacement_name = any(
+        marker in path.name.casefold()
+        for marker in ("замена", "дополнительно")
+    )
+    if is_replacement_name:
+        try:
+            parsed = parse_replacement_xlsx(path)
+        except ValueError as replacement_error:
+            try:
+                parsed = parse_xlsx(path)
+            except ValueError as weekly_error:
+                raise ValueError(
+                    "Не удалось распознать XLSX ни как таблицу замен, ни как недельное расписание. "
+                    f"Формат замен: {replacement_error}; недельный формат: {weekly_error}"
+                ) from replacement_error
+    else:
+        try:
+            parsed = parse_xlsx(path)
+        except ValueError as weekly_error:
+            try:
+                parsed = parse_replacement_xlsx(path)
+            except ValueError as replacement_error:
+                raise ValueError(
+                    "Не удалось распознать XLSX ни как недельное расписание, ни как таблицу замен. "
+                    f"Недельный формат: {weekly_error}; формат замен: {replacement_error}"
+                ) from weekly_error
     if not parsed.get("groups"):
         raise ValueError("В файле не найдено ни одной группы.")
     merged, diff = merge_schedule_data(

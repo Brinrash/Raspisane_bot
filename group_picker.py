@@ -39,6 +39,7 @@ def home_keyboard() -> list[list[dict[str, str]]]:
         [_button("📅 Сегодня", "menu:today"), _button("➡️ Завтра", "menu:tomorrow")],
         [_button("⬅️ Прошлая", "menu:prevweek"), _button("🗓 Текущая", "menu:week"), _button("⏭ Следующая", "menu:nextweek")],
         [_button("🎓 Выбрать группу", "menu:groups"), _button("👥 Моя группа", "menu:mygroup")],
+        [_button("♻️ Сбросить мою группу", "menu:resetgroup")],
         [_button("⏰ Звонки", "menu:bells")],
         [_button("ℹ️ Помощь", "menu:help")],
     ])
