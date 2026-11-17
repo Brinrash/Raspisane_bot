@@ -74,7 +74,7 @@ MAX_ADMIN_IDS=123456789
 1. В `.env` укажи ID исходного канала из адреса MAX или из поля `link.chat_id` пересланной публикации:
 
 ```env
-MAX_SOURCE_CHAT_ID=-69158905315551
+MAX_SOURCE_CHAT_ID=-123456789
 ```
 
 2. Перезапусти `run.bat`.
@@ -125,7 +125,3 @@ Webhook требует публичный HTTPS-домен, путь `/webhook` 
 - `data/bell_schedule.json` — изменения звонков по конкретным датам.
 - `data/incoming/` — временные входящие файлы; старые файлы очищаются автоматически.
 - `.env` — секретный токен и настройки; не публикуй его.
-
-## Размещение на Bothost
-
-Подробная актуальная инструкция для Git-деплоя, переменных окружения, HTTPS/Webhook и миграции данных находится в `HOSTING_BOTHOST.md`. Для Webhook задайте `MAX_WEBHOOK_URL` и `WEBHOOK_SECRET`; без `MAX_WEBHOOK_URL` локально запускается Long Polling.
