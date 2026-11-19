@@ -149,19 +149,17 @@ def merge_schedule_data(
                 # subgroup, the newer row wins; all other lessons are kept.
                 combined = deepcopy(old_lessons or [])
                 for incoming_lesson in new_lessons:
-                    slot_key = (
-                        incoming_lesson.get("pair"),
-                        incoming_lesson.get("lesson_number"),
-                        incoming_lesson.get("subgroup"),
-                    )
                     matched_index = next((
                         index for index, existing_lesson in enumerate(combined)
-                        if existing_lesson.get("lesson_number") is not None
-                        and (
-                            existing_lesson.get("pair"),
-                            existing_lesson.get("lesson_number"),
-                            existing_lesson.get("subgroup"),
-                        ) == slot_key
+                        if (
+                            existing_lesson.get("pair") == incoming_lesson.get("pair")
+                            and existing_lesson.get("subgroup") == incoming_lesson.get("subgroup")
+                            and (
+                                existing_lesson.get("lesson_number") is None
+                                or incoming_lesson.get("lesson_number") is None
+                                or existing_lesson.get("lesson_number") == incoming_lesson.get("lesson_number")
+                            )
+                        )
                     ), None)
                     if matched_index is not None:
                         combined[matched_index] = incoming_lesson

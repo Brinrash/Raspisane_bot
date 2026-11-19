@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import hashlib
 import json
 import logging
 import re
+import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,16 +21,21 @@ from config import (
     MAX_POLL_TIMEOUT, MAX_SOURCE_CHAT_ID, MAX_STATE_PATH, MAX_UPLOAD_BYTES,
     MAX_WEBHOOK_URL, WEBHOOK_SECRET, WEBHOOK_PATH, PORT,
     MAX_USER_DB, NOTIFY_USERS_ON_UPDATE, SCHEDULE_JSON, SCHEDULE_XLSX, TIMEZONE,
+    REFERENCE_DIR, SITE_ARCHIVE_DIR, SITE_MONITOR_ENABLED, SITE_PAGE_URL,
+    SITE_STATE_PATH, SITE_CHECK_INTERVAL_MINUTES, SITE_CHECK_START_HOUR, SITE_CHECK_END_HOUR,
 )
 from bells import (
     bell_for_date, format_bells, load_bell_data, merge_bell_override,
     pair_time, parse_bell_document_dates, prune_bell_data, save_bell_data,
 )
-from group_picker import course_keyboard, group_page_keyboard, home_keyboard
+from group_picker import course_keyboard, group_page_keyboard, home_keyboard, more_keyboard
 from max_api import MaxApi, MaxApiError
 from max_files import download_max_file
-from schedule_manager import import_schedule_file, load_schedule, prune_incoming_files, retention_bounds
+from schedule_manager import import_schedule_file, load_schedule, prune_incoming_files, retention_bounds, merge_schedule_data
 from storage import UserStorage
+from parser import parse_xlsx
+from pdf_schedule import pdf_to_schedule
+from site_monitor import scan_site_once, mark_site_file, load_site_state, next_check_at, invalidate_site_cache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,12 +48,61 @@ schedule: dict[str, Any] = {}
 bell_schedule: dict[str, Any] = {"overrides": {}}
 
 
+def local_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except ZoneInfoNotFoundError:
+        return datetime.now().astimezone()
+
+
 def local_today() -> date:
     try:
         return datetime.now(ZoneInfo(TIMEZONE)).date()
     except ZoneInfoNotFoundError:
         logger.warning("Неизвестный часовой пояс %s; используется системная дата", TIMEZONE)
         return date.today()
+
+
+def remember_reference_xlsx(path: Path, original_name: str) -> Path | None:
+    """Keep weekly admin XLSX files as optional references for site PDFs."""
+    name = Path(original_name).name
+    if any(marker in name.casefold() for marker in ("замена", "дополнительно")):
+        return None
+    try:
+        parsed = parse_xlsx(path)
+    except Exception as exc:
+        logger.info("XLSX %s не добавлен в справочник эталонов: %s", name, exc)
+        return None
+    if not parsed.get("date_from") or not parsed.get("date_to"):
+        return None
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^0-9A-Za-zА-Яа-яЁё._ -]+", "_", name).strip(" .")
+    if not safe_name.lower().endswith(".xlsx"):
+        safe_name += ".xlsx"
+    destination = REFERENCE_DIR / safe_name
+    source_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    old_digest = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.exists() else None
+    if destination.resolve() != path.resolve() and old_digest != source_digest:
+        shutil.copy2(path, destination)
+    if old_digest != source_digest:
+        invalidated = invalidate_site_cache(SITE_STATE_PATH)
+        if invalidated:
+            logger.info("Эталон XLSX обновлён; для %d ранее обработанных PDF назначен повторный разбор", invalidated)
+    references = sorted(
+        REFERENCE_DIR.glob("*.xlsx"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for old_reference in references[8:]:
+        try:
+            old_reference.unlink()
+        except OSError:
+            logger.warning("Не удалось удалить старый XLSX-эталон %s", old_reference)
+    logger.info(
+        "XLSX добавлен в эталоны PDF: %s (%s — %s; %s групп)",
+        destination.name, parsed["date_from"], parsed["date_to"], parsed.get("group_count", 0),
+    )
+    return destination
 
 
 def verify_webhook_secret(expected: str, supplied: str | None) -> bool:
@@ -304,6 +360,7 @@ class ScheduleMaxBot:
         self.marker: int | None = None
         self.state_file = MAX_STATE_PATH
         self.pending_webhook_events: set[str] = set()
+        self.site_check_lock = asyncio.Lock()
 
     async def load_state(self) -> None:
         if not self.state_file.exists():
@@ -340,7 +397,14 @@ class ScheduleMaxBot:
             except Exception:
                 logger.exception("Не удалось отправить сообщение MAX-администратору %s", admin_id)
 
-    async def notify_update(self, diff: dict[str, Any], source: str, filename: str) -> None:
+    async def notify_update(
+        self,
+        diff: dict[str, Any],
+        source: str,
+        filename: str,
+        *,
+        notify_users: bool = True,
+    ) -> None:
         groups = diff.get("changed_groups", [])
         dates = diff.get("changed_dates", [])
         if groups:
@@ -360,16 +424,41 @@ class ScheduleMaxBot:
             admin_text = f"Файл «{filename}» получен из {source}, но изменений не обнаружено."
         await self.send_admins(admin_text)
 
-        if NOTIFY_USERS_ON_UPDATE and groups:
+        if notify_users and NOTIFY_USERS_ON_UPDATE and groups:
             for user_id, group_code in storage.users_for_groups(groups):
                 try:
                     await self.send_user(
                         user_id,
-                        f"🔔 Расписание группы {group_code} обновлено. Открой меню «На неделю», чтобы посмотреть изменения.",
+                        f"🔔 Расписание группы {group_code} изменилось" +
+                        (f" на {', '.join(date_labels)}" if date_labels else "") +
+                        ". Открой «На неделю», чтобы посмотреть обновлённые занятия.",
                         home_keyboard(),
                     )
                 except Exception:
                     logger.exception("Не удалось уведомить MAX-пользователя %s", user_id)
+
+    async def notify_site_changes(self, changes: dict[str, set[str]]) -> None:
+        """Send one consolidated MAX notification per affected user per site scan."""
+        if not NOTIFY_USERS_ON_UPDATE or not changes:
+            return
+        group_codes = sorted(changes, key=lambda value: (len(value), value))
+        for user_id, group_code in storage.users_for_groups(group_codes):
+            labels = []
+            for value in sorted(changes.get(group_code, set())):
+                try:
+                    labels.append(datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m"))
+                except ValueError:
+                    labels.append(value)
+            try:
+                await self.send_user(
+                    user_id,
+                    f"🔔 Расписание группы {group_code} обновилось"
+                    + (f" на {', '.join(labels)}" if labels else "")
+                    + ". Открой «На неделю», чтобы посмотреть актуальные занятия.",
+                    home_keyboard(),
+                )
+            except Exception:
+                logger.exception("Не удалось отправить сводное уведомление MAX-пользователю %s", user_id)
 
     async def apply_xlsx(self, path: Path, original_name: str, source: str) -> dict[str, Any]:
         global schedule
@@ -382,6 +471,8 @@ class ScheduleMaxBot:
             source_name=original_name,
         )
         schedule = new_data
+        if path.suffix.lower() == ".xlsx":
+            remember_reference_xlsx(path, original_name)
         logger.info(
             "Импортировано из %s: %s, changed_groups=%d, dates=%s",
             source, original_name, len(diff.get("changed_groups", [])), diff.get("changed_dates", []),
@@ -389,6 +480,152 @@ class ScheduleMaxBot:
         await self.notify_update(diff, source, original_name)
         prune_incoming_files(INCOMING_DIR, local_today())
         return diff
+
+    async def apply_pdf_document(
+        self,
+        document: dict[str, Any],
+        *,
+        notify_users: bool = True,
+    ) -> dict[str, Any]:
+        """Apply a downloaded PDF; matching XLSX is only an enrichment/reference source."""
+        global schedule
+        parsed = document["parsed"]
+        filename = str(document.get("filename") or parsed.get("source_file") or "schedule.pdf")
+        document_type = parsed.get("document_type")
+        reference_path = document.get("reference_path")
+        skipped: list[dict[str, str]] = []
+
+        # PDF remains the source of truth for current changes. A matching XLSX
+        # may restore clipped names and, only for a weekly PDF with an exact
+        # matching date range, fill group/day blocks that the PDF parser could
+        # not safely read. It never overwrites a block parsed successfully from PDF.
+        incoming, skipped = pdf_to_schedule(parsed, reference_path=reference_path)
+        source_label = "сайт техникума (PDF + эталон XLSX)" if reference_path else "сайт техникума (PDF)"
+        source_filename = f"{filename} | эталон: {Path(reference_path).name}" if reference_path else filename
+
+        target_dates = incoming.get("dates", [])
+        start, end = retention_bounds(local_today())
+        in_window = [value for value in target_dates if start.isoformat() <= value <= end.isoformat()]
+        if not in_window:
+            logger.info("PDF %s пропущен: даты вне окна хранения %s — %s", filename, start, end)
+            return {"changed_groups": [], "changed_dates": [], "skipped_blocks": skipped, "out_of_window": True}
+
+        new_data, diff = merge_schedule_data(
+            schedule,
+            incoming,
+            today=local_today(),
+            source_name=source_filename,
+            source=source_label,
+        )
+        schedule = new_data
+        from parser import save_json
+        save_json(schedule, SCHEDULE_JSON)
+        diff["skipped_blocks"] = skipped
+        diff["reference_xlsx"] = Path(reference_path).name if reference_path else None
+        logger.info(
+            "PDF импортирован: %s; тип=%s; изменено групп=%d; даты=%s; восстановлено XLSX-блоков=%d; пропущено=%d",
+            filename, document_type, len(diff.get("changed_groups", [])),
+            diff.get("changed_dates", []), len(incoming.get("reference_fallback_blocks", [])), len(skipped),
+        )
+        await self.notify_update(diff, source_label, filename, notify_users=notify_users)
+        fallback_blocks = incoming.get("reference_fallback_blocks", [])
+        if fallback_blocks:
+            await self.send_admins(
+                f"ℹ️ В недельном PDF «{filename}» восстановлено из XLSX-эталона блоков групп/дат: "
+                f"{len(fallback_blocks)}. PDF-блоки, успешно распознанные напрямую, оставлены без изменений."
+            )
+        if skipped:
+            preview = ", ".join(f"{item['group']} ({item['date']})" for item in skipped[:12])
+            suffix = f" и ещё {len(skipped) - 12}" if len(skipped) > 12 else ""
+            await self.send_admins(
+                f"⚠️ PDF «{filename}» обработан частично: пропущено групп/дат: {len(skipped)}. "
+                f"Причина — неполные или неоднозначные строки. Проверь XLSX-эталон.\n{preview}{suffix}"
+            )
+        return diff
+
+    async def check_site_now(self, *, force: bool = False) -> dict[str, Any]:
+        """Serialize scheduled and manual site checks."""
+        async with self.site_check_lock:
+            return await self._check_site_now_locked(force=force)
+
+    async def _check_site_now_locked(self, *, force: bool = False) -> dict[str, Any]:
+        """Fetch newly published PDFs and apply them without blocking MAX updates."""
+        result = await asyncio.to_thread(
+            scan_site_once,
+            page_url=SITE_PAGE_URL,
+            archive_dir=SITE_ARCHIVE_DIR,
+            reference_dir=REFERENCE_DIR,
+            state_path=SITE_STATE_PATH,
+            force=force,
+        )
+        applied = 0
+        failed = 0
+        site_changes: dict[str, set[str]] = {}
+        for document in result.get("documents", []):
+            try:
+                diff = await self.apply_pdf_document(document, notify_users=False)
+                for group_code in diff.get("changed_groups", []):
+                    site_changes.setdefault(str(group_code), set()).update(diff.get("changed_dates", []))
+                mark_site_file(SITE_STATE_PATH, document["url"], document["record"], status="processed")
+                applied += 1
+            except Exception as exc:
+                failed += 1
+                mark_site_file(
+                    SITE_STATE_PATH, document["url"], document["record"],
+                    status="failed", error=str(exc),
+                )
+                logger.exception("Не удалось применить PDF с сайта: %s", document.get("filename"))
+                await self.send_admins(
+                    f"⚠️ PDF с сайта «{document.get('filename')}» скачан, но не применён: {exc}. "
+                    "Старое расписание сохранено."
+                )
+        for item in result.get("failures", []):
+            failed += 1
+            logger.error("Ошибка получения PDF %s: %s", item.get("url"), item.get("error"))
+            record = item.get("record")
+            if record and item.get("url"):
+                mark_site_file(
+                    SITE_STATE_PATH, item["url"], record,
+                    status="failed", error=str(item.get("error") or "unknown error"),
+                )
+            await self.send_admins(
+                f"⚠️ Не удалось скачать/разобрать документ с сайта: {item.get('filename')}\n{item.get('error')}"
+            )
+        await self.notify_site_changes(site_changes)
+        logger.info(
+            "Проверка сайта завершена: ссылок=%s, новых PDF=%s, применено=%s, без изменений=%s, ошибок=%s, уведомлено групп=%s",
+            result.get("pdf_links_found"), len(result.get("documents", [])), applied,
+            result.get("unchanged"), failed, len(site_changes),
+        )
+        return {**result, "applied": applied, "failed": failed}
+
+    async def site_monitor_forever(self) -> None:
+        """Run site checks at 00/15/30/45 each hour from 12:00 through 23:45."""
+        if not SITE_MONITOR_ENABLED:
+            logger.info("Автоматическая проверка сайта отключена через SITE_MONITOR_ENABLED")
+            return
+        logger.info(
+            "Мониторинг PDF включён: интервал=%d мин, окно=%02d:00–%02d:00, URL=%s",
+            SITE_CHECK_INTERVAL_MINUTES, SITE_CHECK_START_HOUR, SITE_CHECK_END_HOUR, SITE_PAGE_URL,
+        )
+        while True:
+            now = local_now()
+            target = next_check_at(
+                now,
+                interval_minutes=SITE_CHECK_INTERVAL_MINUTES,
+                start_hour=SITE_CHECK_START_HOUR,
+                end_hour=SITE_CHECK_END_HOUR,
+            )
+            delay = max(0.0, (target - now).total_seconds())
+            logger.info("Следующая проверка сайта: %s (через %.0f сек.)", target.strftime("%d.%m.%Y %H:%M:%S"), delay)
+            await asyncio.sleep(delay)
+            try:
+                await self.check_site_now()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Ошибка плановой проверки расписания на сайте")
+                await self.send_admins("⚠️ Не удалось проверить сайт с расписанием. Подробности в логах хостинга.")
 
     async def apply_bell_file(self, path: Path, original_name: str, source: str) -> dict[str, Any]:
         global bell_schedule
@@ -450,14 +687,20 @@ class ScheduleMaxBot:
         if payload == "noop":
             await self.answer(callback_id, "Страница выбора групп")
             return
-        if payload in {"menu:home", "menu:help"}:
-            text = (
-                "Привет! Я бот расписания занятий.\n\n"
-                "Выбери группу, затем смотри расписание на сегодня, завтра или неделю.\n"
-                "Команды также можно отправлять текстом: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /resetgroup, /myid."
-                if payload == "menu:help" else "Главное меню расписания."
+        if payload == "menu:home":
+            await self.answer(callback_id, "Главное меню · расписание занятий", home_keyboard())
+            return
+        if payload == "menu:more":
+            await self.answer(callback_id, "Дополнительные действия", more_keyboard())
+            return
+        if payload == "menu:help":
+            await self.answer(
+                callback_id,
+                "ℹ️ Помощь\n\nВыбери группу, затем смотри занятия на сегодня, завтра или всю неделю.\n"
+                "Команды: /today, /tomorrow, /week, /prevweek, /nextweek, /group, /mygroup, /resetgroup, /bells.\n"
+                "Группу можно изменить в меню «Ещё». Об изменениях расписания бот сообщит автоматически.",
+                more_keyboard(),
             )
-            await self.answer(callback_id, text, home_keyboard())
             return
         if payload == "menu:groups":
             await self.show_group_picker(user_id, callback_id)
@@ -482,12 +725,12 @@ class ScheduleMaxBot:
             await self.answer(callback_id, week_text(user_id, 1), home_keyboard())
             return
         if payload == "menu:bells":
-            await self.answer(callback_id, bells_text(local_today()), home_keyboard())
+            await self.answer(callback_id, bells_text(local_today()), more_keyboard())
             return
         if payload == "menu:mygroup":
             code = user_group(user_id)
             text = f"Твоя группа: {code}." if code else "Группа ещё не выбрана."
-            buttons = home_keyboard() if code else course_keyboard(schedule.get("groups", {}))
+            buttons = more_keyboard() if code else course_keyboard(schedule.get("groups", {}))
             await self.answer(callback_id, text, buttons)
             return
 
@@ -654,7 +897,12 @@ class ScheduleMaxBot:
             return
 
         if normalized in {"/help", "help", "помощь"}:
-            await reply("Команды: /today, /tomorrow, /prevweek, /week, /nextweek, /bells, /group, /resetgroup, /myid, /status. Также используй кнопки меню.", home_keyboard())
+            await reply(
+                "ℹ️ Помощь\n\nВыбери группу, затем смотри занятия на сегодня, завтра или неделю.\n"
+                "Команды: /today, /tomorrow, /week, /prevweek, /nextweek, /group, /mygroup, /resetgroup, /bells.\n"
+                "Дополнительные функции находятся в меню «Ещё».",
+                more_keyboard(),
+            )
             return
         if normalized in {"/myid", "myid", "мой id", "/id"}:
             await reply(f"Твой MAX user_id: {sender_id}\nДля настройки администратора добавь это число в MAX_ADMIN_IDS файла .env.", home_keyboard())
@@ -691,19 +939,57 @@ class ScheduleMaxBot:
             await reply(week_text(sender_id, 1), home_keyboard())
             return
         if normalized in {"/bells", "звонки", "расписание звонков", "⏰ звонки"}:
-            await reply(bells_text(local_today()), home_keyboard())
+            await reply(bells_text(local_today()), more_keyboard())
             return
         if normalized.startswith("/bells ") or normalized.startswith("звонки "):
             raw_date = normalized.split(maxsplit=1)[1]
             try:
                 target_day = datetime.strptime(raw_date, "%d.%m.%Y").date()
-                await reply(bells_text(target_day), home_keyboard())
+                await reply(bells_text(target_day), more_keyboard())
             except ValueError:
                 await reply("Укажи дату в формате /bells 09.11.2026", home_keyboard())
             return
         if normalized in {"/mygroup", "моя группа"}:
             code = user_group(sender_id)
-            await reply(f"Твоя группа: {code}." if code else "Группа ещё не выбрана.", home_keyboard() if code else course_keyboard(schedule.get("groups", {})))
+            await reply(f"Твоя группа: {code}." if code else "Группа ещё не выбрана.", more_keyboard() if code else course_keyboard(schedule.get("groups", {})))
+            return
+        if normalized in {"/site_check", "/check_site"}:
+            if sender_id not in MAX_ADMIN_IDS:
+                await reply("Команда доступна только администратору.", home_keyboard())
+                return
+            await reply("🔎 Проверяю страницу расписания и новые PDF…", home_keyboard())
+            try:
+                stats = await self.check_site_now(force=False)
+                await reply(
+                    f"Проверка завершена.\nPDF-ссылок: {stats.get('pdf_links_found', 0)}\n"
+                    f"Новых документов: {len(stats.get('documents', []))}\n"
+                    f"Применено: {stats.get('applied', 0)}\nОшибок: {stats.get('failed', 0)}",
+                    home_keyboard(),
+                )
+            except Exception as exc:
+                await reply(f"Не удалось проверить сайт: {exc}", home_keyboard())
+            return
+        if normalized == "/site_status":
+            if sender_id not in MAX_ADMIN_IDS:
+                await reply("Команда доступна только администратору.", home_keyboard())
+                return
+            site_state = load_site_state(SITE_STATE_PATH)
+            site_files = list((site_state.get("files") or {}).values())
+            processed = sum(1 for value in site_files if value.get("status") == "processed")
+            failed_files = sum(1 for value in site_files if value.get("status") == "failed")
+            pending_reference = sum(1 for value in site_files if value.get("status") == "reference_changed")
+            await reply(
+                "🌐 Мониторинг сайта\n"
+                f"Состояние: {'включён' if SITE_MONITOR_ENABLED else 'отключён'}\n"
+                f"Страница: {SITE_PAGE_URL}\n"
+                f"Последняя проверка: {site_state.get('last_checked_at', 'ещё не выполнялась')}\n"
+                f"PDF-ссылок на последней проверке: {site_state.get('pdf_links_found', 0)}\n"
+                f"Успешно обработано URL: {processed}\n"
+                f"Ошибки последней обработки: {failed_files}\n"
+                f"Ожидает повторной сверки с XLSX: {pending_reference}\n"
+                f"Расписание проверок: каждые {SITE_CHECK_INTERVAL_MINUTES} мин. с {SITE_CHECK_START_HOUR:02d}:00 до {SITE_CHECK_END_HOUR:02d}:00",
+                home_keyboard(),
+            )
             return
         if normalized == "/status":
             if sender_id not in MAX_ADMIN_IDS:
@@ -892,12 +1178,17 @@ async def main() -> None:
         me = await api.get_me()
         logger.info("Авторизация MAX успешна: %s", me.get("name") or me.get("username") or me.get("user_id") or "бот")
         bot = ScheduleMaxBot(api)
-        if MAX_WEBHOOK_URL:
-            logger.info("Режим работы: MAX Webhook (%s)", MAX_WEBHOOK_URL)
-            await bot.webhook_forever()
-        else:
-            logger.info("Режим работы: MAX Long Polling")
-            await bot.poll_forever()
+        site_task = asyncio.create_task(bot.site_monitor_forever(), name="site-pdf-monitor")
+        try:
+            if MAX_WEBHOOK_URL:
+                logger.info("Режим работы: MAX Webhook (%s)", MAX_WEBHOOK_URL)
+                await bot.webhook_forever()
+            else:
+                logger.info("Режим работы: MAX Long Polling")
+                await bot.poll_forever()
+        finally:
+            site_task.cancel()
+            await asyncio.gather(site_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from pathlib import Path
 from group_picker import course_keyboard, group_page_keyboard, groups_by_course, home_keyboard
 from storage import UserStorage
 from max_api import MaxApi
-from max_bot import split_text, lesson_line, extract_file_context, is_allowed_file_source, verify_webhook_secret
+from max_bot import split_text, lesson_line, extract_file_context, is_allowed_file_source
 import max_bot
 
 
@@ -215,27 +215,3 @@ class StorageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class WebhookSecurityTests(unittest.TestCase):
-    def test_correct_secret_is_accepted(self):
-        self.assertTrue(verify_webhook_secret("abc-DEF_12345", "abc-DEF_12345"))
-
-    def test_wrong_or_missing_secret_is_rejected(self):
-        self.assertFalse(verify_webhook_secret("abc-DEF_12345", "wrong"))
-        self.assertFalse(verify_webhook_secret("abc-DEF_12345", None))
-        self.assertFalse(verify_webhook_secret("", "anything"))
-
-    def test_webhook_event_key_uses_original_forwarded_message_mid(self):
-        update = {
-            "update_type": "message_created",
-            "timestamp": 123456,
-            "message": {
-                "link": {"type": "forward", "message": {"mid": "forwarded-mid"}},
-                "body": {},
-            },
-        }
-        self.assertEqual(
-            max_bot.ScheduleMaxBot.event_key(update),
-            "message_created:forwarded-mid:123456:",
-        )

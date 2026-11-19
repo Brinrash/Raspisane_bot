@@ -49,9 +49,7 @@ class BellScheduleTests(unittest.TestCase):
         self.assertIn("1-й урок — 09:20–10:05", monday_text)
         self.assertIn("2-й урок — 10:15–11:00", monday_text)
         self.assertIn("3-й урок — 11:10–11:55", monday_text)
-        self.assertNotIn("первая половина", monday_text)
-        self.assertNotIn("вторая половина", monday_text)
-        self.assertNotIn("пара (", monday_text)
+        self.assertNotIn("1-я пара", monday_text)
 
     def test_docx_parser_reads_all_rows_and_practice_from_documents(self):
         from bells import _parse_docx

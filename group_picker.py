@@ -35,13 +35,20 @@ def _keyboard(buttons: list[list[dict[str, str]]]) -> list[list[dict[str, str]]]
 
 
 def home_keyboard() -> list[list[dict[str, str]]]:
+    """Compact primary menu; secondary tools live under the More tab."""
     return _keyboard([
         [_button("📅 Сегодня", "menu:today"), _button("➡️ Завтра", "menu:tomorrow")],
-        [_button("⬅️ Прошлая", "menu:prevweek"), _button("🗓 Текущая", "menu:week"), _button("⏭ Следующая", "menu:nextweek")],
-        [_button("🎓 Выбрать группу", "menu:groups"), _button("👥 Моя группа", "menu:mygroup")],
-        [_button("♻️ Сбросить мою группу", "menu:resetgroup")],
-        [_button("⏰ Звонки", "menu:bells")],
-        [_button("ℹ️ Помощь", "menu:help")],
+        [_button("⬅️ Прошлая", "menu:prevweek"), _button("🗓 На неделю", "menu:week"), _button("⏭ Следующая", "menu:nextweek")],
+        [_button("🎓 Выбрать группу", "menu:groups"), _button("⚙️ Ещё", "menu:more")],
+    ])
+
+
+def more_keyboard() -> list[list[dict[str, str]]]:
+    """Secondary account and help actions, kept off the main screen."""
+    return _keyboard([
+        [_button("👥 Моя группа", "menu:mygroup"), _button("♻️ Сбросить группу", "menu:resetgroup")],
+        [_button("⏰ Звонки", "menu:bells"), _button("ℹ️ Помощь", "menu:help")],
+        [_button("↩️ Главное меню", "menu:home")],
     ])
 
 
