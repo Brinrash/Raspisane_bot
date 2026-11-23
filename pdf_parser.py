@@ -28,7 +28,7 @@ except ImportError:
     print("PyMuPDF is missing. Install it with: python -m pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(2)
 
-VERSION = "0.5"
+VERSION = "0.8"
 DATE_RE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
 GROUP_RE = re.compile(r"^\d{3}$")
 NUM_RE = re.compile(r"^\d{1,2}$")
@@ -345,22 +345,107 @@ def extract_cell_fields(
     }
 
 
+def get_page_date_positions(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return date labels in visual top-to-bottom order with their vertical centers.
+
+    In the college's weekly PDF, the date labels are rotated vertically at the
+    left edge of each day's table. Their y-position is a more reliable day
+    boundary signal than the first pair number: a day may legitimately start
+    at pair 2, 3, or later when earlier pairs are empty/not scheduled.
+    """
+    positions: dict[str, float] = {}
+    for word in words:
+        if not DATE_RE.fullmatch(word["text"]):
+            continue
+        try:
+            day = iso_date(word["text"])
+        except ValueError:
+            continue
+        center_y = (float(word["y0"]) + float(word["y1"])) / 2
+        # Keep the first stable position if the PDF text layer duplicates a label.
+        positions.setdefault(day, center_y)
+    return [
+        {"date": day, "y": y}
+        for day, y in sorted(positions.items(), key=lambda item: item[1])
+    ]
+
+
 def get_page_dates(words: list[dict[str, Any]]) -> list[str]:
-    dates = set()
-    for w in words:
-        if DATE_RE.fullmatch(w["text"]):
-            try:
-                dates.add(iso_date(w["text"]))
-            except ValueError:
-                pass
-    return sorted(dates)
+    return [item["date"] for item in get_page_date_positions(words)]
+
+
+def weekly_day_separator_lines(page: fitz.Page) -> list[float]:
+    """Detect full-width horizontal rules separating weekday table blocks.
+
+    Pair-row separators start inside the date column (x≈60); weekday separators
+    cross the left date column too (x≈40) and are drawn thicker. The college's
+    PDF uses thin filled rectangles for these rules, so inspect both rectangles
+    and horizontal path segments.
+    """
+    values: list[float] = []
+    min_width = page.rect.width * 0.45
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if item[0] == "re":
+                rect = item[1]
+                if rect.y0 >= 90 and rect.x0 <= 46 and rect.width >= min_width and rect.height >= 0.8:
+                    values.append((float(rect.y0) + float(rect.y1)) / 2)
+            elif item[0] == "l":
+                a, b = item[1], item[2]
+                if (
+                    abs(float(a.y) - float(b.y)) <= 0.8
+                    and min(float(a.x), float(b.x)) <= 46
+                    and abs(float(b.x) - float(a.x)) >= min_width
+                    and float(a.y) >= 90
+                ):
+                    values.append((float(a.y) + float(b.y)) / 2)
+    result: list[float] = []
+    for value in sorted(values):
+        if not result or abs(value - result[-1]) > 1.5:
+            result.append(value)
+    return result
+
+
+def _weekly_day_regions(
+    page: fitz.Page,
+    date_positions: list[dict[str, Any]],
+) -> list[tuple[float, float]]:
+    """Build (top,bottom) bounds for each dated day using grid separators."""
+    if not date_positions:
+        return []
+    centers = [float(item["y"]) for item in date_positions]
+    lines = weekly_day_separator_lines(page)
+    if len(centers) == 1:
+        before = [value for value in lines if value < centers[0]]
+        after = [value for value in lines if value > centers[0]]
+        if before and after:
+            return [(max(before), min(after))]
+        return []
+
+    separators: list[float] = []
+    for left, right in zip(centers, centers[1:]):
+        candidates = [value for value in lines if left < value < right]
+        if len(candidates) != 1:
+            # Ambiguous/missing grid line: let the caller use the pair-reset fallback.
+            return []
+        separators.append(candidates[0])
+
+    first_candidates = [value for value in lines if value < centers[0]]
+    last_candidates = [value for value in lines if value > centers[-1]]
+    if not first_candidates or not last_candidates:
+        return []
+    outer = [max(first_candidates), *separators, min(last_candidates)]
+    if len(outer) != len(date_positions) + 1 or any(a >= b for a, b in zip(outer, outer[1:])):
+        return []
+    return list(zip(outer, outer[1:]))
 
 
 def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: list[str] | None = None) -> dict[str, Any]:
     words = extract_words(page)
     rules = vertical_rules(page)
     spans = page_group_headers(page, words, "weekly", rules)
-    dates = get_page_dates(words)
+    date_positions = get_page_date_positions(words)
+    dates = [item["date"] for item in date_positions]
     page_text = page.get_text("text")
     course_match = re.search(r"([1-5](?:\s*[,и]\s*[1-5])*)\s*курсы", page_text, re.I)
     course = f"{re.sub(r'\s+', '', course_match.group(1))} курсы" if course_match else None
@@ -370,7 +455,7 @@ def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: lis
     # Weekly timetable row labels are pair numbers, each followed by subject and teacher lines.
     markers = []
     for w in words:
-        if 58 <= w["x0"] <= 67 and 100 <= w["y0"] <= page.rect.height - 20 and NUM_RE.fullmatch(w["text"]):
+        if 58 <= w["x0"] <= 67 and 90 <= w["y0"] <= page.rect.height - 20 and NUM_RE.fullmatch(w["text"]):
             value = int(w["text"])
             if 1 <= value <= 8:
                 markers.append({"pair": value, "y": w["y0"]})
@@ -380,18 +465,45 @@ def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: lis
         if not unique_markers or abs(marker["y"] - unique_markers[-1]["y"]) > 3:
             unique_markers.append(marker)
 
-    # A day begins when the numbered rows reset to 1; each daily table has at least 25pt gap.
-    day_starts = []
-    for marker in unique_markers:
-        if marker["pair"] == 1 and (not day_starts or marker["y"] - day_starts[-1]["y"] > 25):
-            day_starts.append(marker)
+    # Prefer the actual full-width table separators. The number column may
+    # start at pair 2/3, so pair-number resets are only a fallback, never the
+    # primary day-boundary detector.
     day_blocks = []
-    for index, start in enumerate(day_starts):
-        end = day_starts[index + 1]["y"] if index + 1 < len(day_starts) else page.rect.height - 4
-        block_markers = [m for m in unique_markers if start["y"] - 1 <= m["y"] < end]
-        date_value = dates[index] if index < len(dates) else None
-        weekday = WEEKDAYS[datetime.fromisoformat(date_value).weekday()] if date_value else None
-        day_blocks.append({"date": date_value, "weekday": weekday, "markers": block_markers})
+    regions = _weekly_day_regions(page, date_positions)
+    if regions:
+        for date_item, (top, bottom) in zip(date_positions, regions):
+            date_value = date_item["date"]
+            weekday = WEEKDAYS[datetime.fromisoformat(date_value).weekday()]
+            block_markers = [m for m in unique_markers if top - 0.5 <= m["y"] < bottom - 0.5]
+            day_blocks.append({"date": date_value, "weekday": weekday, "markers": block_markers})
+    elif date_positions:
+        # Fallback: split the monotonic pair-number sequence whenever it resets.
+        # This still handles a first visible pair of 2 or 3. Empty days cannot
+        # be inferred this way, but the diagnostic warning records that fact.
+        marker_groups: list[list[dict[str, Any]]] = []
+        current_group: list[dict[str, Any]] = []
+        for marker in unique_markers:
+            if current_group and marker["pair"] <= current_group[-1]["pair"]:
+                marker_groups.append(current_group)
+                current_group = []
+            current_group.append(marker)
+        if current_group:
+            marker_groups.append(current_group)
+        for index, date_item in enumerate(date_positions):
+            date_value = date_item["date"]
+            weekday = WEEKDAYS[datetime.fromisoformat(date_value).weekday()]
+            block_markers = marker_groups[index] if index < len(marker_groups) else []
+            day_blocks.append({"date": date_value, "weekday": weekday, "markers": block_markers})
+    else:
+        # No date labels: retain a clearly unresolved day segmentation.
+        day_starts = []
+        for marker in unique_markers:
+            if marker["pair"] == 1 and (not day_starts or marker["y"] - day_starts[-1]["y"] > 25):
+                day_starts.append(marker)
+        for index, start in enumerate(day_starts):
+            end = day_starts[index + 1]["y"] if index + 1 < len(day_starts) else page.rect.height - 4
+            block_markers = [m for m in unique_markers if start["y"] - 1 <= m["y"] < end]
+            day_blocks.append({"date": None, "weekday": None, "markers": block_markers})
 
     entries = []
     groups: list[dict[str, Any]] = []
@@ -399,19 +511,25 @@ def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: lis
     for span in spans:
         split = find_room_split(words, span, "weekly", rules)
         group_days = []
+        class_hour_entry = None
         # Class-hour row is between group header and first numbered lesson.
         if first_date:
             class_hour = extract_cell_fields(words, span, split, 102.0, 108.0, 7.2, 6.0, subject_dictionary)
             if class_hour["subject"] and "классный час" in class_hour["subject"].casefold():
-                entry = {
+                class_hour_entry = {
                     "group": span["group"], "date": first_date, "pair": 0,
                     "lesson_numbers": [], "document_type": "weekly", **class_hour,
                     "source_page": page_number,
                 }
-                entries.append(entry)
+                entries.append(class_hour_entry)
 
-        for block in day_blocks:
+        for block_index, block in enumerate(day_blocks):
             day_entries = []
+            if block_index == 0 and class_hour_entry is not None:
+                # Keep the class-hour record in the per-group/day block as well
+                # as the flat entries array. The schedule converter uses the
+                # block representation so it can preserve explicitly empty days.
+                day_entries.append(class_hour_entry)
             for marker in block["markers"]:
                 fields = extract_cell_fields(
                     words, span, split,
@@ -437,7 +555,7 @@ def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: lis
             group_days.append({"date": block["date"], "weekday": block["weekday"], "entries": day_entries})
         groups.append({"group": span["group"], "course": course, "days": group_days})
 
-    return {"page": page_number, "course": course, "groups": groups, "entries": entries}
+    return {"page": page_number, "course": course, "dates": dates, "groups": groups, "entries": entries}
 
 
 def replacement_header_rows(words: list[dict[str, Any]], rules: list[float]) -> list[tuple[float, list[dict[str, Any]]]]:
@@ -549,6 +667,9 @@ def parse_pdf(path: Path, subject_dictionary: list[str] | None = None) -> dict[s
             if entry.get("date"):
                 all_dates.add(entry["date"])
         if kind == "weekly":
+            # Include date labels even when a table has no numbered lesson rows
+            # for a day; the complete week must still replace stale cached days.
+            all_dates.update(str(day) for day in parsed.get("dates", []) if day)
             for group in parsed.get("groups", []):
                 for day in group.get("days", []):
                     if day.get("date"):

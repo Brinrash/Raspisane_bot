@@ -32,7 +32,30 @@ def pdf_to_schedule(
 
     groups: dict[str, dict[str, Any]] = {}
     skipped: list[dict[str, str]] = []
-    for (group, day), rows in grouped.items():
+    doc_type = str(parsed.get("document_type") or "")
+
+    # Weekly PDF pages explicitly describe every group/date cell, including
+    # empty days. Preserve those empty blocks so an old cached Thursday/Friday
+    # is cleared instead of silently surviving when the new PDF has no lessons.
+    weekly_blocks: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    if doc_type == "weekly":
+        for page in parsed.get("pages", []):
+            for page_group in page.get("groups", []):
+                group_code = str(page_group.get("group") or "").strip()
+                if not group_code:
+                    continue
+                for day_block in page_group.get("days", []):
+                    day_value = str(day_block.get("date") or "").strip()
+                    if day_value:
+                        weekly_blocks[(group_code, day_value)] = list(day_block.get("entries") or [])
+
+    # Use page-level weekly blocks where available. For older parser payloads
+    # and daily replacement PDFs, the flat entries list remains authoritative.
+    source_blocks = dict(weekly_blocks)
+    for key, rows in grouped.items():
+        source_blocks.setdefault(key, rows)
+
+    for (group, day), rows in source_blocks.items():
         uncertain = [
             row for row in rows
             if row.get("needs_review") or not str(row.get("subject") or "").strip()
@@ -46,12 +69,11 @@ def pdf_to_schedule(
             continue
 
         lessons = _pdf_rows_to_lessons(rows)
-        if lessons:
-            target = groups.setdefault(group, {"sheet": "PDF", "days": {}})
-            target["days"][day] = lessons
+        target = groups.setdefault(group, {"sheet": "PDF", "days": {}})
+        # An explicitly empty weekly block is meaningful: no lessons that day.
+        target["days"][day] = lessons
 
     recovered_reference_blocks: list[dict[str, str]] = []
-    doc_type = str(parsed.get("document_type") or "")
     dates = sorted(str(day) for day in (parsed.get("dates") or []))
 
     # A same-range XLSX can safely complete the weekly timetable where PDF text
@@ -63,7 +85,10 @@ def pdf_to_schedule(
             and str(reference.get("date_to") or "") == str(parsed.get("date_to") or dates[-1])
         ):
             blocked_keys = {(item["group"], item["date"]) for item in skipped}
-            existing_keys = set(grouped)
+            # A present-but-empty PDF block is not a missing block and must not
+            # be repopulated from the XLSX baseline. Fallback is only for truly
+            # absent or rejected blocks.
+            existing_keys = set(source_blocks)
             for group_code, group_data in reference.get("groups", {}).items():
                 for day in dates:
                     ref_lessons = group_data.get("days", {}).get(day)

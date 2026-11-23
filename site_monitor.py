@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from pdf_parser import load_subject_dictionary, parse_pdf
+from pdf_parser import VERSION as PDF_PARSER_VERSION, load_subject_dictionary, parse_pdf
 from reference_match import apply_reference, select_reference_xlsx
 from site_downloader import DEFAULT_URL, USER_AGENTS, collect_pdf_links, fetch_page, safe_filename
 
@@ -220,10 +220,13 @@ def scan_site_once(
             "Accept": "application/pdf,*/*;q=0.8",
             "Referer": final_page_url,
         }
-        # A new XLSX reference invalidates the old parse even if the PDF bytes
-        # are unchanged, so skip HTTP validators once for that URL.
+        # A new XLSX reference or a new parser version invalidates the old
+        # parse even if the PDF bytes are unchanged. Do not send HTTP validators
+        # for one scan so the source is downloaded and reparsed.
         reference_was_updated = previous.get("status") == "reference_changed"
-        if not force and not reference_was_updated:
+        parser_version_matches = previous.get("parser_version") == PDF_PARSER_VERSION
+        parser_was_updated = not parser_version_matches
+        if not force and not reference_was_updated and not parser_was_updated:
             if previous.get("etag"):
                 headers["If-None-Match"] = str(previous["etag"])
             if previous.get("last_modified"):
@@ -246,15 +249,16 @@ def scan_site_once(
                 "last_modified": response.headers.get("Last-Modified"),
                 "filename": _filename_from_response(response, index),
                 "final_url": response.url,
+                "parser_version": PDF_PARSER_VERSION,
                 "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
             current_record = record
-            if not force and not reference_was_updated and previous.get("sha256") == digest and previous.get("status") == "processed":
+            if not force and not reference_was_updated and parser_version_matches and previous.get("sha256") == digest and previous.get("status") == "processed":
                 unchanged += 1
                 # Refresh HTTP validators even if the body is identical.
                 mark_site_file(state_path, url, record, status="processed")
                 continue
-            if not force and not reference_was_updated and previous.get("sha256") == digest and previous.get("status") == "failed":
+            if not force and not reference_was_updated and parser_version_matches and previous.get("sha256") == digest and previous.get("status") == "failed":
                 unchanged += 1
                 continue
 

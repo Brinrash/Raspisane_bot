@@ -239,6 +239,29 @@ def apply_reference(data: dict[str, Any], reference_path: str | Path) -> dict[st
             {"subject": x["subject"], "subgroup": x.get("subgroup"), "room": x.get("room"), "teacher": x.get("teacher")}
             for x in baseline
         ]
+        if baseline and entry.get("subgroup") not in (1, 2):
+            # If the PDF clipped only the (1 п/г)/(2 п/г) marker, restore it
+            # only when subject + teacher + room identify exactly one subgroup
+            # in the same group's same date/pair XLSX slot. Never infer across
+            # different teachers/rooms or from the whole-week catalogue.
+            subject_key = _norm(entry.get("subject"))
+            teacher_key = _normalize_teacher(entry.get("teacher"))
+            room_key = _normalize_room(entry.get("room"))
+            same_slot = [
+                item for item in baseline
+                if _norm(item.get("subject")) == subject_key
+                and (not teacher_key or _normalize_teacher(item.get("teacher")) == teacher_key)
+                and (not room_key or _normalize_room(item.get("room")) == room_key)
+                and item.get("subgroup") in (1, 2)
+            ]
+            subgroup_candidates = {item.get("subgroup") for item in same_slot}
+            if len(subgroup_candidates) == 1:
+                entry["subgroup"] = next(iter(subgroup_candidates))
+                entry["subgroup_marker_repaired"] = True
+                flags = list(entry.get("quality_flags") or [])
+                if "subgroup_recovered_from_same_slot_xlsx" not in flags:
+                    flags.append("subgroup_recovered_from_same_slot_xlsx")
+                entry["quality_flags"] = flags
         if not baseline:
             entry["reference_slot_status"] = "not_in_reference"
             missing_slots += 1
