@@ -1,5 +1,5 @@
 aiohttp>=3.9,<4.0
-python-dotenv>=1.0,<2.0
+python-dotenv==1.0.1
 tzdata>=2025.1
 pypdf>=5.1,<7.0
 PyMuPDF>=1.25,<2.0
