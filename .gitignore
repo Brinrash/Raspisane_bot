@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+data/max_users.sqlite3
+data/max_state.json
+data/incoming/*
+data/schedule.json
+data/bell_schedule.json
+data/schedule.xlsx
+
+data/references/*
+data/site_documents/*
+data/site_sync_state.json
