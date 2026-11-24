@@ -448,7 +448,11 @@ def parse_weekly_page(page: fitz.Page, page_number: int, subject_dictionary: lis
     dates = [item["date"] for item in date_positions]
     page_text = page.get_text("text")
     course_match = re.search(r"([1-5](?:\s*[,и]\s*[1-5])*)\s*курсы", page_text, re.I)
-    course = f"{re.sub(r'\s+', '', course_match.group(1))} курсы" if course_match else None
+    if course_match:
+        course_number = re.sub(r"\s+", "", course_match.group(1))
+        course = f"{course_number} курсы"
+    else:
+        course = None
     if not spans:
         return {"page": page_number, "course": course, "groups": [], "entries": [], "warning": "Не найдена строка групп"}
 
